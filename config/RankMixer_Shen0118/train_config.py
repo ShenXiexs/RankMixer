@@ -68,6 +68,7 @@ class TrainConfig:
 
             # ===== Tokenization =====
             "tokenization_strategy": "semantic",
+            # v2 使用 tokenization_v2.py 的更新语义分组规则。
             "tokenization_version": "v2",
             "semantic_target_tokens": 64,
             "semantic_groups": {},

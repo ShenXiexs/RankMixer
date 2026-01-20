@@ -1,5 +1,5 @@
-# models/rankmixer_shen0118.py
-# RankMixer_Shen0118 Estimator: strict paper-style token mixing + per-token FFN (+ optional MoE).
+# 模型入口：models/rankmixer_shen0118.py
+# RankMixer_Shen0118 Estimator：严格论文版 token mixing + per-token FFN（可选 MoE）。
 from collections import OrderedDict
 
 import tensorflow.compat.v1 as tf
@@ -22,7 +22,7 @@ from common.metrics import evaluate
 logger = tf.compat.v1.logging
 
 
-# Build seq_length if missing.
+# 若未配置 seq_length，则根据 seq_features_config 构建。
 if not hasattr(TrainConfig, "seq_length"):
     TrainConfig.seq_length = OrderedDict(
         (cfg["name"], cfg["length"])
@@ -92,6 +92,7 @@ class RankMixerBlock(tf.layers.Layer):
     def call(self, x, training=False):
         moe_loss = tf.constant(0.0)
         if self.ln_style == "post":
+            # Post-LN：先 mix/ffn，再残差相加并归一化。
             y = self.token_mixer(x, training=training)
             x = self.ln1(x + y)
             if self.use_moe:
@@ -100,6 +101,7 @@ class RankMixerBlock(tf.layers.Layer):
                 z = self.per_token_ffn(x, training=training)
             out = self.ln2(x + z)
         else:
+            # Pre-LN：先归一化，再 mix/ffn，最后残差相加。
             y = self.ln1(x)
             y = self.token_mixer(y, training=training)
             x = x + y
@@ -177,6 +179,7 @@ def _pad_trunc_to_length(tokens_dense, length):
     cur = tf.shape(tokens_dense)[1]
     tokens_cut = tokens_dense[:, :tf.minimum(cur, length)]
     pad_len = tf.maximum(0, length - tf.shape(tokens_cut)[1])
+    # 用空字符串补齐到固定长度。
     tokens_fix = tf.pad(tokens_cut, paddings=[[0, 0], [0, pad_len]])
     tokens_fix.set_shape([None, length])
     return tokens_fix
@@ -187,6 +190,7 @@ def _get_seq_embedding(tokens_2d, embeddings_table, policy, name="seq_lookup"):
     length = tf.shape(tokens_2d)[1]
     flat = tf.reshape(tokens_2d, [-1])
     uniq, idx = tf.unique(flat)
+    # 将字符串 token 哈希为 int64 id 以做动态 embedding 查表。
     ids = tf.strings.to_hash_bucket_strong(uniq, 2 ** 63 - 1, [1, 2])
     update_tstp_op = policy.apply_update(ids)
     restrict_op = policy.apply_restriction(int(1e8))
@@ -203,6 +207,7 @@ def _get_dense_emb_from_features(features, embeddings_table, policy):
     fea_size = len(select_feature)
     flat = tf.reshape(x, [-1])
     uniq, idx = tf.unique(flat)
+    # 将字符串 token 哈希为 int64 id 以做动态 embedding 查表。
     ids = tf.strings.to_hash_bucket_strong(uniq, 2 ** 63 - 1, [1, 2])
     update_tstp_op = policy.apply_update(ids)
     restrict_op = policy.apply_restriction(int(1e8))
@@ -214,6 +219,7 @@ def _get_dense_emb_from_features(features, embeddings_table, policy):
 
 def _sequence_pool(seq_emb, tokens, mode="mean"):
     mode = str(mode).lower()
+    # 将 "" 和 "0" 视作序列 padding。
     pad_mask = tf.logical_or(tf.equal(tokens, ""), tf.equal(tokens, "0"))
     valid = tf.cast(tf.logical_not(pad_mask), tf.float32)
     denom = tf.reduce_sum(valid, axis=1, keepdims=True) + 1e-6
@@ -259,6 +265,7 @@ def _prepare_seq_tokens(features, embeddings_table, policy, seq_cfg, pool_modes,
     seq_tokens = []
     seq_names = []
     for seq_col, length in seq_cfg.items():
+        # 按配置长度切分每个序列列的原始 tokens。
         tokens_slice = seq_features_flat[:, start:start + length]
         start += length
         mask = tf.equal(tokens_slice, tf.constant("0", dtype=tf.string))
@@ -342,6 +349,7 @@ def model_fn(features, labels, mode, params):
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
     rank_cfg = params.get("rankmixer", {}) if params else {}
 
+    # 模型规模与正则相关参数。
     d_model = int(rank_cfg.get("d_model", 128))
     num_layers = int(rank_cfg.get("num_layers", 2))
     num_tokens = int(rank_cfg.get("num_tokens", rank_cfg.get("semantic_target_tokens", 16)))
@@ -357,6 +365,7 @@ def model_fn(features, labels, mode, params):
     input_dropout = float(rank_cfg.get("input_dropout", 0.0))
     head_dropout = float(rank_cfg.get("head_dropout", 0.0))
 
+    # Tokenization 策略与版本选择。
     tokenization = str(rank_cfg.get("tokenization_strategy", rank_cfg.get("tokenization", "semantic"))).lower()
     tokenization_version = str(rank_cfg.get("tokenization_version",
                                             rank_cfg.get("tokenizer_version", "v1"))).lower()
@@ -385,6 +394,7 @@ def model_fn(features, labels, mode, params):
     ps_num = int(params.get("ps_num", 0)) if params else 0
     restrict = bool(params.get("restrict", False)) if params else False
 
+    # 配置 TFRA 动态 embedding 的设备分布。
     device = params.get("device", "CPU") if params else "CPU"
     if is_training:
         devices_info = ["/job:localhost/replica:0/task:{}/{}:{}".format(i, device, i) for i in range(ps_num)]
@@ -415,6 +425,7 @@ def model_fn(features, labels, mode, params):
     dense_embeddings = None
     dense_feature_names = []
     if use_other:
+        # dense 特征后续会作为单独 token 参与。
         other_emb, up_t, rs_t = _get_dense_emb_from_features(features, embeddings_table, policy)
         update_ops.append(up_t)
         if restrict:
@@ -433,6 +444,7 @@ def model_fn(features, labels, mode, params):
         seq_embeddings = seq_tokens
         seq_embeddings.set_shape([None, seq_token_count, embedding_size])
 
+    # RankMixer 仅支持 semantic tokenization 与无参 token mixing。
     if tokenization != "semantic":
         raise ValueError("RankMixer_Shen0118 expects semantic tokenization.")
 
@@ -440,6 +452,7 @@ def model_fn(features, labels, mode, params):
         raise ValueError("RankMixer_Shen0118 only supports parameter-free token mixing.")
 
     if tokenization_version in ("v2", "tokenization_v2", "semantic_v2"):
+        # v2 使用更新后的默认语义分组规则。
         tokenizer_cls = SemanticTokenizerV2
     else:
         tokenizer_cls = SemanticTokenizer
@@ -454,6 +467,7 @@ def model_fn(features, labels, mode, params):
     )
 
     if include_seq_in_tokenization:
+        # 将序列池化特征纳入语义 tokenization。
         tokens, token_count = tokenizer.tokenize(
             dense_embeddings, dense_feature_names, seq_embeddings, seq_names
         )
@@ -480,6 +494,7 @@ def model_fn(features, labels, mode, params):
         tokens = tf.concat([cls_token, tokens], axis=1)
         token_count += 1
 
+    # 无参 token mixing 强制 H = T。
     if num_heads != token_count:
         raise ValueError("paper_strict token mixing requires num_heads == token_count.")
 
@@ -513,6 +528,7 @@ def model_fn(features, labels, mode, params):
     encoded = encoder(tokens, training=is_training)
     encoded.set_shape([None, token_count, d_model])
 
+    # 将 tokens 池化为单向量供任务塔使用。
     if output_pooling in ("mean", "avg"):
         head_input = tf.reduce_mean(encoded, axis=1)
     elif output_pooling == "cls":
@@ -526,6 +542,7 @@ def model_fn(features, labels, mode, params):
         head_input = tf.nn.dropout(head_input, keep_prob=1.0 - head_dropout)
 
     def _build_task_tower(input_tensor, scope_name):
+        # 每个任务使用两层 MLP 头。
         with tf.compat.v1.variable_scope(scope_name):
             net = tf.compat.v1.layers.dense(input_tensor, units=d_model * 2, activation=gelu, name="dense1")
             if head_dropout and is_training:
@@ -553,6 +570,7 @@ def model_fn(features, labels, mode, params):
     ctcvr_prob = ctr_prob * cvr_prob
     ctcvr_loss = _binary_cross_entropy_from_probs(ctcvr_label, ctcvr_prob) if has_ctcvr else tf.constant(0.0)
 
+    # 总 loss 可选叠加 conditional CVR 与 MoE 正则。
     total_loss = ctr_loss + (ctcvr_loss if use_ctcvr_loss else 0.0)
 
     cvr_loss = tf.constant(0.0, dtype=tf.float32)
@@ -590,6 +608,7 @@ def model_fn(features, labels, mode, params):
         groups.append(up_op)
     groups.extend(update_ops)
 
+    # 输出预测供线上服务与离线评估。
     batch_size = tf.shape(ctr_prob)[0]
     out_tensor = tf.concat([ctr_label, ctcvr_label, ctr_prob, cvr_prob, ctcvr_prob], axis=1)
     predictions = {
@@ -635,6 +654,7 @@ def model_fn(features, labels, mode, params):
             loss=model.losses,
             eval_metric_ops=eval_metric_ops)
 
+    # 对可训练变量做 L2 正则（不含 bias）。
     trainable_variables = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES)
     l2_reg = float(params.get("l2_reg", 1e-6)) if params else 1e-6
     if l2_reg > 0:
@@ -655,6 +675,7 @@ def model_fn(features, labels, mode, params):
     min_learning_rate = float(opt_cfg.get("min_learning_rate", 0.0))
     grad_clip_norm = float(opt_cfg.get("grad_clip_norm", 0.0))
 
+    # 学习率调度与可选 warmup。
     lr = tf.constant(learning_rate, dtype=tf.float32)
     if decay_steps and decay_steps > 0 and decay_type in ("cosine", "poly", "polynomial"):
         gs = tf.cast(global_step, tf.int32)
@@ -687,6 +708,7 @@ def model_fn(features, labels, mode, params):
     grad_norm = tf.linalg.global_norm(grads) if grads else tf.constant(0.0, tf.float32)
     loggings["grad_norm"] = grad_norm
     if grad_clip_norm and grad_clip_norm > 0 and grads:
+        # 裁剪全局范数以提升训练稳定性。
         clipped_grads, _ = tf.clip_by_global_norm(grads, clip_norm=grad_clip_norm)
         it = iter(clipped_grads)
         clipped_gv = []

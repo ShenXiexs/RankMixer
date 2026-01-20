@@ -4,6 +4,7 @@ import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
 
+# v2 的更新分组规则，源自新的特征分组方案。
 DEFAULT_SEMANTIC_GROUP_RULES = [
     {"name": "customer_dpa", "patterns": [
         r"^commission$",
@@ -600,6 +601,7 @@ def _compile_group_rules(group_rules):
 
 
 def _assign_semantic_groups(feature_names, group_rules):
+    # 按规则命中顺序排序特征，未命中放末尾。
     compiled = _compile_group_rules(group_rules)
     grouped = []
     used = set()
@@ -710,6 +712,7 @@ class SemanticTokenizer(object):
         groups = _normalize_groups(self.semantic_groups)
         with tf.compat.v1.variable_scope(self.name, reuse=tf.compat.v1.AUTO_REUSE):
             if groups:
+                # 显式 semantic_groups：一个 group 对应一个 token。
                 tokens = []
                 for group_name, group_features in groups:
                     resolved = self._resolve_group_features(group_features, available_names)
@@ -724,6 +727,7 @@ class SemanticTokenizer(object):
                 stacked.set_shape([None, self.target_tokens, self.d_model])
                 return stacked, self.target_tokens
 
+            # 规则分组：先排序，再均分为 T 个 token。
             ordered_names = available_names
             if self.group_rules or DEFAULT_SEMANTIC_GROUP_RULES:
                 ordered_indices = _assign_semantic_groups(available_names, self.group_rules)

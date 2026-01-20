@@ -27,16 +27,17 @@ class ParameterFreeTokenMixer(tf.layers.Layer):
         super(ParameterFreeTokenMixer, self).build(input_shape)
 
     def call(self, x, training=False):
-        # x: [B, T, D]
+        # x 形状: [B, T, D]
         batch_size = tf.shape(x)[0]
         t_count = self.num_tokens
         h_count = self.num_heads
         d_head = self.d_head
 
+        # 先拆分 head，再交换 token/head 轴完成混合。
         split = tf.reshape(x, [batch_size, t_count, h_count, d_head])
-        shuffled = tf.transpose(split, [0, 2, 1, 3])  # [B, H, T, D/H]
-        merged = tf.reshape(shuffled, [batch_size, h_count, t_count * d_head])  # [B, H, D]
-        mixed = tf.reshape(merged, [batch_size, t_count, self.d_model])  # [B, T, D]
+        shuffled = tf.transpose(split, [0, 2, 1, 3])  # 形状: [B, H, T, D/H]
+        merged = tf.reshape(shuffled, [batch_size, h_count, t_count * d_head])  # 形状: [B, H, D]
+        mixed = tf.reshape(merged, [batch_size, t_count, self.d_model])  # 形状: [B, T, D]
 
         if self.dropout and training:
             mixed = tf.nn.dropout(mixed, keep_prob=1.0 - self.dropout)

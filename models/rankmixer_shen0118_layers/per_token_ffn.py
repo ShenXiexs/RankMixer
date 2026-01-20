@@ -22,6 +22,7 @@ class PerTokenFFN(tf.layers.Layer):
     def build(self, input_shape):
         hidden_dim = self.d_model * self.mult
         init = tf.variance_scaling_initializer(scale=2.0)
+        # 每个 token 独立参数：各自的 FFN 权重。
         self.W1 = self.add_weight("W1", [self.num_tokens, self.d_model, hidden_dim], initializer=init)
         self.b1 = self.add_weight("b1", [self.num_tokens, hidden_dim], initializer=tf.zeros_initializer())
         self.W2 = self.add_weight("W2", [self.num_tokens, hidden_dim, self.d_model], initializer=init)
@@ -29,10 +30,12 @@ class PerTokenFFN(tf.layers.Layer):
         super(PerTokenFFN, self).build(input_shape)
 
     def call(self, x, training=False):
+        # btd x tdh -> bth，逐 token 线性变换。
         h = tf.einsum("btd,tdh->bth", x, self.W1) + self.b1
         h = gelu(h)
         if self.dropout and training:
             h = tf.nn.dropout(h, keep_prob=1.0 - self.dropout)
+        # bth x thd -> btd，恢复 token 维度
         y = tf.einsum("bth,thd->btd", h, self.W2) + self.b2
         if self.dropout and training:
             y = tf.nn.dropout(y, keep_prob=1.0 - self.dropout)

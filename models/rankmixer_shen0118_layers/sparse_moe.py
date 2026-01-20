@@ -81,10 +81,12 @@ class PerTokenSparseMoE(tf.layers.Layer):
         super(PerTokenSparseMoE, self).build(input_shape)
 
     def _router_logits(self, x, w, b):
+        # 每个 token 的路由 logits，用于专家选择。
         return tf.einsum("btd,tde->bte", x, w) + b
 
     def call(self, x, training=False):
-        # x: [B, T, D]
+        # x 形状: [B, T, D]
+        # 计算每个 token 的专家输出。
         h = tf.einsum("btd,tedh->bteh", x, self.W1) + self.b1
         h = gelu(h)
         if self.dropout and training:
@@ -95,6 +97,7 @@ class PerTokenSparseMoE(tf.layers.Layer):
 
         gate_train_logits = self._router_logits(x, self.gate_w_train, self.gate_b_train)
         if self.routing_type == "relu_dtsi":
+            # 训练阶段使用 soft 路由以提高专家覆盖。
             gate_train = tf.nn.softmax(gate_train_logits, axis=-1)
         elif self.routing_type == "relu":
             gate_train = tf.nn.relu(gate_train_logits)
@@ -102,15 +105,18 @@ class PerTokenSparseMoE(tf.layers.Layer):
             raise ValueError("Unsupported routing_type: %s" % self.routing_type)
 
         if self.use_dtsi:
+            # 推理阶段使用 ReLU gate 以获得稀疏激活。
             gate_infer_logits = self._router_logits(x, self.gate_w_infer, self.gate_b_infer)
             gate_infer = tf.nn.relu(gate_infer_logits)
         else:
             gate_infer = gate_train
 
+        # 训练/推理选择不同 gate。
         gate = gate_train if training else gate_infer
         y = tf.reduce_sum(expert_out * tf.expand_dims(gate, -1), axis=2)
 
         if self.l1_coef > 0.0:
+            # L1 惩罚鼓励稀疏专家激活。
             scale = 1.0 / max(self.sparsity_ratio, 1e-6)
             l1_loss = self.l1_coef * scale * tf.reduce_mean(tf.reduce_sum(gate_infer, axis=-1))
         else:
