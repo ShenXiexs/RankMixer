@@ -20,9 +20,8 @@ config/
     boundaries_map.json / fg.json
 models/
   rankmixer_shen0118.py         # 模型主入口（Estimator model_fn）
-  rankmixer_shen0118_layers/
+  rankmixer_layers/
     tokenization.py             # Tokenization v1（默认规则）
-    tokenization_v2.py          # Tokenization v2（新的分组规则，参考0119群内分享的分组规则）
     token_mixing.py             # 参数无关 Token Mixing
     per_token_ffn.py            # Per-token FFN
     sparse_moe.py               # Sparse-MoE 版本的 Per-token FFN
@@ -58,7 +57,8 @@ paper_ref/
 通过 `train_config.py` 中的 `tokenization_version` 控制：
 
 - `v1`：使用 `tokenization.py` 的默认分组规则
-- `v2`：使用 `tokenization_v2.py` 的新分组规则（当前默认）
+- `v2`：使用 `tokenization_v2.py`，默认与 v1 一致（用于兼容/扩展）
+- `v3`：使用 `tokenization_v3.py`，默认与 v1 一致（用于兼容/扩展）
 
 配置示例（`config/RankMixer_Shen0118/train_config.py`）：
 
@@ -78,18 +78,19 @@ Tokenization 有两种模式：
 
 2. **规则分组（DEFAULT_SEMANTIC_GROUP_RULES）**
    - 当 `semantic_groups` 为空时使用；
-   - `tokenization_v2.py` 中的默认规则已按你的新分组设计写入；
+   - v2/v3 默认规则与 v1 保持一致（不内置额外特征分组）；
    - 实际流程是：先按规则排序特征，然后均匀 chunk 成 `T` 个 token；
    - 未命中规则的特征会放在排序末尾，保证不会丢特征。
 
 ### 4.3 关键实现文件
 
-- `models/rankmixer_shen0118_layers/tokenization.py`
-- `models/rankmixer_shen0118_layers/tokenization_v2.py`
+- `models/rankmixer_layers/tokenization.py`
+- `models/rankmixer_layers/tokenization_v2.py`
+- `models/rankmixer_layers/tokenization_v3.py`
 
 ## 5. Token Mixing 实现
 
-文件：`models/rankmixer_shen0118_layers/token_mixing.py`
+文件：`models/rankmixer_layers/token_mixing.py`
 
 核心特性：
 
@@ -103,7 +104,7 @@ Tokenization 有两种模式：
 
 ### 6.1 Per-token FFN
 
-文件：`models/rankmixer_shen0118_layers/per_token_ffn.py`
+文件：`models/rankmixer_layers/per_token_ffn.py`
 
 每个 token 独立一套 `W1/W2` 参数：
 
@@ -114,7 +115,7 @@ Tokenization 有两种模式：
 
 ### 6.2 Sparse-MoE
 
-文件：`models/rankmixer_shen0118_layers/sparse_moe.py`
+文件：`models/rankmixer_layers/sparse_moe.py`
 
 特点：
 
@@ -137,7 +138,7 @@ Tokenization 有两种模式：
 在 `model_fn` 中：
 
 - 对编码后 token 做 pooling（默认 mean）
-- 进入两个 task tower（CTR / CVR）
+- 进入共享 MLP head，再分别输出 CTR / CVR logits
 - CTCVR = CTR * CVR
 - Loss = CTR loss + CTCVR loss (+ optional CVR conditional loss)
 
@@ -155,10 +156,14 @@ Tokenization 有两种模式：
   - 选择 v1/v2 规则
 - `token_mixing_type`
   - 默认 `paper_strict`（要求 H = T）
+- `enable_timing`
+  - 可选的图内耗时统计（输出到训练日志）
 - `use_moe / moe_num_experts / moe_sparsity_ratio`
   - 1B 版扩展相关
 - `seq_pool`
   - 序列 pooling 策略
+- `use_hkv`
+  - 动态 embedding 是否使用 GPU/HKV；关闭时使用 CPU Cuckoo 表
 
 ## 10. 运行方式（与原工程一致）
 

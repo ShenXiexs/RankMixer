@@ -68,7 +68,7 @@ class TrainConfig:
 
             # ===== Tokenization =====
             "tokenization_strategy": "semantic",
-            # v2 使用 tokenization_v2.py 的更新语义分组规则。
+            # v2 为兼容版本，默认规则与 v1 一致（可通过自定义规则覆盖）。
             "tokenization_version": "v2",
             "semantic_target_tokens": 64,
             "semantic_groups": {},
@@ -207,4 +207,3 @@ class TrainConfig_1B(TrainConfig):
         "moe_routing_type": "relu_dtsi",
         "moe_l1_lambda": 0.01,
     })
-

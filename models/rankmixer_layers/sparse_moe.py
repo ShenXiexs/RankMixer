@@ -2,7 +2,7 @@ import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
 
-from models.rankmixer_shen0118_layers.per_token_ffn import gelu
+from models.rankmixer_layers.per_token_ffn import gelu
 
 
 class PerTokenSparseMoE(tf.layers.Layer):

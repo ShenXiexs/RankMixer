@@ -7,15 +7,50 @@ tf.disable_v2_behavior()
 import tensorflow_recommenders_addons as tfra
 import tensorflow_recommenders_addons.dynamic_embedding as de
 
-from models.ctr_hstu_seq import LayerNorm
-from models.rankmixer_shen0118_layers import (
+try:
+    from tensorflow_recommenders_addons.dynamic_embedding import CuckooHashTableCreator
+except Exception:
+    CuckooHashTableCreator = None
+
+
+class LayerNorm(tf.layers.Layer):
+    """Lightweight LayerNorm to avoid dependency on models.ctr_hstu_seq."""
+
+    def __init__(self, epsilon=1e-6, center=True, scale=True, name=None):
+        super(LayerNorm, self).__init__(name=name)
+        self.epsilon = epsilon
+        self.center = center
+        self.scale = scale
+
+    def build(self, input_shape):
+        dim = input_shape[-1].value if hasattr(input_shape[-1], "value") else int(input_shape[-1])
+        if self.scale:
+            self.gamma = self.add_variable("gamma", shape=[dim], initializer=tf.ones_initializer())
+        else:
+            self.gamma = None
+        if self.center:
+            self.beta = self.add_variable("beta", shape=[dim], initializer=tf.zeros_initializer())
+        else:
+            self.beta = None
+        super(LayerNorm, self).build(input_shape)
+
+    def call(self, inputs, **kwargs):
+        mean, var = tf.nn.moments(inputs, axes=[-1], keepdims=True)
+        outputs = (inputs - mean) / tf.sqrt(var + self.epsilon)
+        if self.scale:
+            outputs = outputs * self.gamma
+        if self.center:
+            outputs = outputs + self.beta
+        return outputs
+from models.rankmixer_layers import (
     ParameterFreeTokenMixer,
     PerTokenFFN,
     PerTokenSparseMoE,
     SemanticTokenizer,
-    SemanticTokenizerV2,
     gelu,
 )
+from models.rankmixer_layers.tokenization_v2 import SemanticTokenizer as SemanticTokenizerV2
+from models.rankmixer_layers.tokenization_v3 import SemanticTokenizer as SemanticTokenizerV3
 from common.utils import select_feature, train_config as TrainConfig, seq_features_config
 from common.metrics import evaluate
 
@@ -318,6 +353,22 @@ def _pick_label(source_features, source_labels, candidates):
     return None
 
 
+def _collect_deps(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        deps = []
+        for item in value:
+            deps.extend(_collect_deps(item))
+        return deps
+    if isinstance(value, dict):
+        deps = []
+        for item in value.values():
+            deps.extend(_collect_deps(item))
+        return deps
+    return [value]
+
+
 def _get_train_date_from_flags():
     try:
         flags = tf.app.flags.FLAGS
@@ -348,6 +399,23 @@ def _resolve_learning_rate(opt_cfg):
 def model_fn(features, labels, mode, params):
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
     rank_cfg = params.get("rankmixer", {}) if params else {}
+    enable_timing = bool(rank_cfg.get("enable_timing", False))
+    time_logs = OrderedDict()
+
+    def _timed(name, fn):
+        if not enable_timing:
+            return fn()
+        t0 = tf.timestamp()
+        with tf.control_dependencies([t0]):
+            out = fn()
+        deps = _collect_deps(out)
+        if deps:
+            with tf.control_dependencies(deps):
+                t1 = tf.timestamp()
+        else:
+            t1 = tf.timestamp()
+        time_logs["time_%s_ms" % name] = (t1 - t0) * 1000.0
+        return out
 
     # 模型规模与正则相关参数。
     d_model = int(rank_cfg.get("d_model", 128))
@@ -394,13 +462,20 @@ def model_fn(features, labels, mode, params):
     ps_num = int(params.get("ps_num", 0)) if params else 0
     restrict = bool(params.get("restrict", False)) if params else False
 
-    # 配置 TFRA 动态 embedding 的设备分布。
     device = params.get("device", "CPU") if params else "CPU"
+    use_hkv_cfg = rank_cfg.get("use_hkv")
+    if use_hkv_cfg is None:
+        use_hkv = (device == "GPU")
+    else:
+        use_hkv = bool(use_hkv_cfg)
+    emb_device = "GPU" if (device == "GPU" and use_hkv) else "CPU"
+    if not use_hkv:
+        logger.info("DynamicEmbedding: use_hkv=False, using CPU cuckoo table.")
     if is_training:
-        devices_info = ["/job:localhost/replica:0/task:{}/{}:{}".format(i, device, i) for i in range(ps_num)]
+        devices_info = ["/job:localhost/replica:0/task:{}/{}:{}".format(i, emb_device, i) for i in range(ps_num)]
         initializer = tf.compat.v1.random_normal_initializer(-1, 1)
     elif mode in (tf.estimator.ModeKeys.EVAL, tf.estimator.ModeKeys.PREDICT):
-        devices_info = ["/job:localhost/replica:0/task:{}/{}:0".format(0, device) for _ in range(ps_num)]
+        devices_info = ["/job:localhost/replica:0/task:{}/{}:0".format(0, emb_device) for _ in range(ps_num)]
         initializer = tf.compat.v1.zeros_initializer()
     else:
         devices_info = ["/job:localhost/replica:0/task:{}/CPU:0".format(0) for _ in range(ps_num)]
@@ -408,9 +483,15 @@ def model_fn(features, labels, mode, params):
     if len(devices_info) == 0:
         devices_info = "/job:localhost/replica:0/task:0/CPU:0"
 
-    embeddings_table = tfra.dynamic_embedding.get_variable(
-        name="embeddings", dim=embedding_size, devices=devices_info,
-        trainable=is_training, initializer=initializer)
+    kv_creator = CuckooHashTableCreator() if (not use_hkv and CuckooHashTableCreator) else None
+    if kv_creator is None:
+        embeddings_table = tfra.dynamic_embedding.get_variable(
+            name="embeddings", dim=embedding_size, devices=devices_info,
+            trainable=is_training, initializer=initializer)
+    else:
+        embeddings_table = tfra.dynamic_embedding.get_variable(
+            name="embeddings", dim=embedding_size, devices=devices_info,
+            trainable=is_training, initializer=initializer, kv_creator=kv_creator)
 
     policy = tfra.dynamic_embedding.TimestampRestrictPolicy(embeddings_table)
     update_tstp_op = policy.apply_update(tf.constant([0], dtype=tf.int64))
@@ -425,8 +506,10 @@ def model_fn(features, labels, mode, params):
     dense_embeddings = None
     dense_feature_names = []
     if use_other:
-        # dense 特征后续会作为单独 token 参与。
-        other_emb, up_t, rs_t = _get_dense_emb_from_features(features, embeddings_table, policy)
+        other_emb, up_t, rs_t = _timed(
+            "dense_lookup",
+            lambda: _get_dense_emb_from_features(features, embeddings_table, policy),
+        )
         update_ops.append(up_t)
         if restrict:
             update_ops.append(rs_t)
@@ -437,8 +520,11 @@ def model_fn(features, labels, mode, params):
 
     seq_embeddings = None
     seq_names = []
-    seq_tokens, seq_token_count, seq_names = _prepare_seq_tokens(
-        features, embeddings_table, policy, seq_cfg, seq_pool_modes, restrict, update_ops, return_names=True
+    seq_tokens, seq_token_count, seq_names = _timed(
+        "seq_prepare",
+        lambda: _prepare_seq_tokens(
+            features, embeddings_table, policy, seq_cfg, seq_pool_modes, restrict, update_ops, return_names=True
+        ),
     )
     if seq_tokens is not None:
         seq_embeddings = seq_tokens
@@ -451,8 +537,9 @@ def model_fn(features, labels, mode, params):
     if token_mixing_type not in ("paper_strict", "paper", "param_free"):
         raise ValueError("RankMixer_Shen0118 only supports parameter-free token mixing.")
 
-    if tokenization_version in ("v2", "tokenization_v2", "semantic_v2"):
-        # v2 使用更新后的默认语义分组规则。
+    if tokenization_version in ("v3", "tokenization_v3", "semantic_v3"):
+        tokenizer_cls = SemanticTokenizerV3
+    elif tokenization_version in ("v2", "tokenization_v2", "semantic_v2"):
         tokenizer_cls = SemanticTokenizerV2
     else:
         tokenizer_cls = SemanticTokenizer
@@ -467,14 +554,15 @@ def model_fn(features, labels, mode, params):
     )
 
     if include_seq_in_tokenization:
-        # 将序列池化特征纳入语义 tokenization。
-        tokens, token_count = tokenizer.tokenize(
-            dense_embeddings, dense_feature_names, seq_embeddings, seq_names
+        tokens, token_count = _timed(
+            "tokenize",
+            lambda: tokenizer.tokenize(dense_embeddings, dense_feature_names, seq_embeddings, seq_names),
         )
         seq_token_count = 0
     else:
-        tokens, token_count = tokenizer.tokenize(
-            dense_embeddings, dense_feature_names, None, None
+        tokens, token_count = _timed(
+            "tokenize",
+            lambda: tokenizer.tokenize(dense_embeddings, dense_feature_names, None, None),
         )
         if seq_embeddings is not None and seq_token_count > 0:
             seq_proj = seq_embeddings
@@ -525,7 +613,7 @@ def model_fn(features, labels, mode, params):
         use_final_ln=use_final_ln,
         name="rankmixer_encoder",
     )
-    encoded = encoder(tokens, training=is_training)
+    encoded = _timed("encoder", lambda: encoder(tokens, training=is_training))
     encoded.set_shape([None, token_count, d_model])
 
     # 将 tokens 池化为单向量供任务塔使用。
@@ -541,18 +629,18 @@ def model_fn(features, labels, mode, params):
     if head_dropout and is_training:
         head_input = tf.nn.dropout(head_input, keep_prob=1.0 - head_dropout)
 
-    def _build_task_tower(input_tensor, scope_name):
-        # 每个任务使用两层 MLP 头。
-        with tf.compat.v1.variable_scope(scope_name):
-            net = tf.compat.v1.layers.dense(input_tensor, units=d_model * 2, activation=gelu, name="dense1")
-            if head_dropout and is_training:
-                net = tf.nn.dropout(net, keep_prob=1.0 - head_dropout)
-            net = tf.compat.v1.layers.dense(net, units=d_model, activation=gelu, name="dense2")
-            logit = tf.compat.v1.layers.dense(net, units=1, activation=None, name="logit")
-        return logit
+    def _head_forward():
+        head_hidden = tf.compat.v1.layers.dense(head_input, units=d_model * 2, activation=gelu,
+                                                name="rankmixer_head_dense1")
+        if head_dropout and is_training:
+            head_hidden = tf.nn.dropout(head_hidden, keep_prob=1.0 - head_dropout)
+        head_hidden = tf.compat.v1.layers.dense(head_hidden, units=d_model, activation=gelu,
+                                                name="rankmixer_head_dense2")
+        ctr_logits = tf.compat.v1.layers.dense(head_hidden, units=1, activation=None, name="ctr_logit")
+        cvr_logits = tf.compat.v1.layers.dense(head_hidden, units=1, activation=None, name="cvr_logit")
+        return ctr_logits, cvr_logits
 
-    ctr_logits = _build_task_tower(head_input, "ctr_tower")
-    cvr_logits = _build_task_tower(head_input, "cvr_tower")
+    ctr_logits, cvr_logits = _timed("head", _head_forward)
 
     ctr_label_raw = _pick_label(features, labels, ["click_label", "ctr_label", "is_click"])
     if ctr_label_raw is None:
@@ -599,6 +687,8 @@ def model_fn(features, labels, mode, params):
         "rankmixer_tokens": tf.constant(int(token_count), dtype=tf.int32),
         "rankmixer_heads": tf.constant(int(num_heads), dtype=tf.int32),
     })
+    if time_logs:
+        loggings.update(time_logs)
     if use_conditional_cvr:
         loggings["cvr_losses"] = cvr_loss
     if use_moe:
