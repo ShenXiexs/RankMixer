@@ -129,9 +129,15 @@ class TrainConfig:
     ]
 
     # ======================= 标签映射 / 预测输出列 =======================
-    # 跟模型中prediction中out的输出对其，给模型输出补key，组成json格式，用于推理模型的效果存储
-    predict_columns = [k for k,v in label_schema.items() if v.endswith("_label")] \
-                    + [v.replace("_label", "_pred") for k,v in label_schema.items() if v.endswith("_label")]  # 必填
+    # 与 models/rankmixer_shen0202.py 中 out_tensor 顺序保持一致：
+    # [ctr_label, ctcvr_label, ctr_prob, cvr_prob, ctcvr_prob]
+    predict_columns = [
+        "is_click",
+        "is_conversion",
+        "ctr_pred",
+        "cvr_pred",
+        "ctcvr_pred",
+    ]  # 必填
 
     # ======================= 解析/压缩配置 =======================
     field_sep = "\003"  # 字段的分隔符
