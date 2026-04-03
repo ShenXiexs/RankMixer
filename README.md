@@ -1,5 +1,7 @@
 # RankMixer Reproduction Guide
 
+For a quick start version, you may refer to encap version: https://github.com/ShenXiexs/rankMixer-encap
+
 This project is an engineering reproduction of the paper *"RankMixer: Scaling Up Ranking Models in Industrial Recommenders"*.
 It implements the core RankMixer architecture in an existing server-side training framework, and adds an optional Sparse-MoE extension plus practical training details. The project files directly map to the production server code structure.
 
